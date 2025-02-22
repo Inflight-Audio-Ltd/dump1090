@@ -159,6 +159,8 @@ struct client *createGenericClient(struct net_service *service, int fd)
     c->fd         = fd;
     c->buflen     = 0;
     c->modeac_requested = 0;
+    c->verbatim_requested = (service == Modes.beast_verbatim_service || service == Modes.beast_verbatim_local_service);
+    c->local_requested = (service == Modes.beast_verbatim_local_service);
     Modes.clients = c;
 
     moveNetClient(c, service);
@@ -267,10 +269,11 @@ void modesInitNet(void) {
     s = serviceInit("Raw TCP output", &Modes.raw_out, send_raw_heartbeat, READ_MODE_IGNORE, NULL, NULL);
     serviceListen(s, Modes.net_bind_address, Modes.net_output_raw_ports);
 
-    // we maintain two output services, one producing a stream of verbatim messages, one producing a stream of cooked messages
+    // we maintain three output services for the different option setting combinations we support
     // and switch clients between them if they request a change in mode
     Modes.beast_cooked_service = serviceInit("Beast TCP output (cooked mode)", &Modes.beast_cooked_out, send_beast_heartbeat, READ_MODE_BEAST_COMMAND, NULL, handleBeastCommand);
     Modes.beast_verbatim_service = serviceInit("Beast TCP output (verbatim mode)", &Modes.beast_verbatim_out, send_beast_heartbeat, READ_MODE_BEAST_COMMAND, NULL, handleBeastCommand);
+    Modes.beast_verbatim_local_service = serviceInit("Beast TCP output (verbatim+local mode)", &Modes.beast_verbatim_local_out, send_beast_heartbeat, READ_MODE_BEAST_COMMAND, NULL, handleBeastCommand);
 
     if (Modes.net_verbatim)
         serviceListen(Modes.beast_verbatim_service, Modes.net_bind_address, Modes.net_output_beast_ports);
@@ -399,13 +402,22 @@ static void completeWrite(struct net_writer *writer, void *endptr) {
 //
 // Write raw output in Beast Binary format with Timestamp to TCP clients
 //
-static void modesSendBeastVerbatimOutput(struct modesMessage *mm, struct aircraft __attribute__((unused)) *a) {
+static void modesSendBeastVerbatimOutput(struct modesMessage *mm) {
     // Don't forward mlat messages, unless --forward-mlat is set
     if (mm->source == SOURCE_MLAT && !Modes.forward_mlat)
         return;
 
     // Do verbatim output for all messages
     writeBeastMessage(&Modes.beast_verbatim_out, mm->timestampMsg, mm->signalLevel, mm->verbatim, mm->msgbits / 8);
+}
+
+static void modesSendBeastVerbatimLocalOutput(struct modesMessage *mm) {
+    // Never forward remote messages
+    if (mm->remote)
+        return;
+
+    // Do verbatim output for all messages
+    writeBeastMessage(&Modes.beast_verbatim_local_out, mm->timestampMsg, mm->signalLevel, mm->verbatim, mm->msgbits / 8);
 }
 
 static void modesSendBeastCookedOutput(struct modesMessage *mm, struct aircraft *a) {
@@ -834,10 +846,10 @@ static void modesSendStratuxOutput(struct modesMessage *mm, struct aircraft *a) 
         is_mlat_str = "true";
 
     p = safe_snprintf(p, end,
-            "{\"Icao_addr\":%d,"
+            "{\"Icao_addr\":%u,"
             "\"DF\":%d,\"CA\":%d,"
-            "\"TypeCode\":%d,"
-            "\"SubtypeCode\":%d,"
+            "\"TypeCode\":%u,"
+            "\"SubtypeCode\":%u,"
             "\"SignalLevel\":%f,"
             "\"Gain\":%f,"
             "\"IsMlat\":%s,",
@@ -932,7 +944,7 @@ static void modesSendStratuxOutput(struct modesMessage *mm, struct aircraft *a) 
 
     // navigation accuracy category - position
     if (mm->accuracy.nac_p_valid) {
-        p = safe_snprintf(p, end, "\"NACp\":%d,", mm->accuracy.nac_p);
+        p = safe_snprintf(p, end, "\"NACp\":%u,", mm->accuracy.nac_p);
     } else {
         p = safe_snprintf(p, end, "\"NACp\":null,");
     }
@@ -965,7 +977,7 @@ static void modesSendStratuxOutput(struct modesMessage *mm, struct aircraft *a) 
     struct tm stTime_receive;
     time_t received = (time_t) (mm->sysTimestampMsg / 1000);
     gmtime_r(&received, &stTime_receive);
-    p = safe_snprintf(p, end, "\"Timestamp\":\"%04d-%02d-%02dT%02d:%02d:%02d.%03dZ\"",
+    p = safe_snprintf(p, end, "\"Timestamp\":\"%04d-%02d-%02dT%02d:%02d:%02d.%03uZ\"",
             (stTime_receive.tm_year+1900),(stTime_receive.tm_mon+1),
             stTime_receive.tm_mday, stTime_receive.tm_hour,
             stTime_receive.tm_min, stTime_receive.tm_sec,
@@ -1005,7 +1017,8 @@ void modesQueueOutput(struct modesMessage *mm, struct aircraft *a) {
     modesSendSBSOutput(mm, a);
     modesSendStratuxOutput(mm, a);
     modesSendRawOutput(mm, a);
-    modesSendBeastVerbatimOutput(mm, a);
+    modesSendBeastVerbatimOutput(mm);
+    modesSendBeastVerbatimLocalOutput(mm);
     modesSendBeastCookedOutput(mm, a);
     writeFATSVEvent(mm, a);
 }
@@ -1083,7 +1096,11 @@ void sendBeastSettings(struct client *c, const char *settings)
     char *buf, *p;
 
     len = strlen(settings) * 3;
-    buf = p = alloca(len);
+    buf = p = malloc(len);
+    if (!buf) {
+        fprintf(stderr, "Out of memory sending beast settings string\n");
+        exit(1);
+    }
 
     while (*settings) {
         *p++ = 0x1a;
@@ -1092,6 +1109,7 @@ void sendBeastSettings(struct client *c, const char *settings)
     }
 
     anetWrite(c->fd, buf, len);
+    free(buf);
 }
 
 // Move a network client to a new service
@@ -1156,10 +1174,20 @@ static int handleFaupCommand(struct client *c, char *p) {
     return 0;
 }
 
+// Move a client to the right output service based on
+// the currently requested options
+static void handleOptionsChange(struct client *c) {
+    if (c->local_requested)
+        moveNetClient(c, Modes.beast_verbatim_local_service);
+    else if (c->verbatim_requested)
+        moveNetClient(c, Modes.beast_verbatim_service);
+    else
+        moveNetClient(c, Modes.beast_cooked_service);
+}
+
 //
-// Handle a Beast command message.
-// Currently, we just look for the Mode A/C command message
-// and ignore everything else.
+// Handle a Beast command message. Currently we support only j/J, l/L, v/V
+// and ignore other options
 //
 static int handleBeastCommand(struct client *c, char *p) {
     if (p[0] != '1') {
@@ -1177,10 +1205,20 @@ static int handleBeastCommand(struct client *c, char *p) {
         autoset_modeac();
         break;
     case 'v':
-        moveNetClient(c, Modes.beast_cooked_service);
+        c->verbatim_requested = 0;
+        handleOptionsChange(c);
         break;
     case 'V':
-        moveNetClient(c, Modes.beast_verbatim_service);
+        c->verbatim_requested = 1;
+        handleOptionsChange(c);
+        break;
+    case 'l':
+        c->local_requested = 0;
+        handleOptionsChange(c);
+        break;
+    case 'L':
+        c->local_requested = 1;
+        handleOptionsChange(c);
         break;
     }
 
@@ -1781,7 +1819,7 @@ char *generateAircraftJson(const char *url_path, int *len) {
         if (a->adsb_version >= 0)
             p = safe_snprintf(p, end, ",\"version\":%d", a->adsb_version);
         if (trackDataValid(&a->nic_baro_valid))
-            p = safe_snprintf(p, end, ",\"nic_baro\":%u", a->nic_baro);
+            p = safe_snprintf(p, end, ",\"nic_baro\":%u", (unsigned) a->nic_baro);
         if (trackDataValid(&a->nac_p_valid))
             p = safe_snprintf(p, end, ",\"nac_p\":%u", a->nac_p);
         if (trackDataValid(&a->nac_v_valid))
@@ -1879,7 +1917,10 @@ static char * appendStatsJson(char *p,
         if (st->peak_signal_power > 0)
             p = safe_snprintf(p, end, ",\"peak_signal\":%.1f", 10 * log10(st->peak_signal_power));
 
-        p = safe_snprintf(p, end, ",\"strong_signals\":%d}", st->strong_signal_count);
+        p = safe_snprintf(p, end, ",\"strong_signals\":%u", st->strong_signal_count);
+        if (st->sdr_gain >= 0)
+            p = safe_snprintf(p, end, ",\"gain_db\":%.1f", sdrGetGainDb(st->sdr_gain));
+        p = safe_snprintf(p, end, "}");
     }
 
     if (Modes.net) {
@@ -1967,7 +2008,7 @@ static char * appendStatsJson(char *p,
                           ",\"loud_decoded\":%u"
                           ",\"noise_dbfs\":%.1f"
                           ",\"gain_seconds\":[",
-                          sdrGetGainDb(st->adaptive_gain),
+                          sdrGetGainDb(st->sdr_gain),
                           sdrGetGainDb(st->adaptive_range_gain_limit),
                           st->adaptive_gain_changes,
                           st->adaptive_loud_undecoded,
@@ -2665,8 +2706,8 @@ static void writeFATSV()
             (trackDataValid(&a->mach_valid) && fabs(a->mach - a->fatsv_emitted_mach) >= 0.02);
 
         int immediate =
-            (trackDataValid(&a->nav_altitude_mcp_valid) && unsigned_difference(a->nav_altitude_mcp, a->fatsv_emitted_nav_altitude_mcp) > 50) ||
-            (trackDataValid(&a->nav_altitude_fms_valid) && unsigned_difference(a->nav_altitude_fms, a->fatsv_emitted_nav_altitude_fms) > 50) ||
+            (trackDataValid(&a->nav_altitude_mcp_valid) && abs(a->nav_altitude_mcp - a->fatsv_emitted_nav_altitude_mcp) > 50) ||
+            (trackDataValid(&a->nav_altitude_fms_valid) && abs(a->nav_altitude_fms - a->fatsv_emitted_nav_altitude_fms) > 50) ||
             (trackDataValid(&a->nav_altitude_src_valid) && a->nav_altitude_src != a->fatsv_emitted_nav_altitude_src) ||
             (trackDataValid(&a->nav_heading_valid) && heading_difference(a->nav_heading, a->fatsv_emitted_nav_heading) > 2) ||
             (trackDataValid(&a->nav_modes_valid) && a->nav_modes != a->fatsv_emitted_nav_modes) ||
@@ -2747,7 +2788,7 @@ static void writeFATSV()
             p = appendFATSVMeta(p, end, "sil_type",    a, &a->sil_valid,           "%s",       sil_type_enum_string(a->sil_type));
         }
         if (trackDataValid(&a->nic_baro_valid) && (forceEmit || a->nic_baro != a->fatsv_emitted_nic_baro)) {
-            p = appendFATSVMeta(p, end, "nic_baro",    a, &a->nic_baro_valid,      "%u",       a->nic_baro);
+            p = appendFATSVMeta(p, end, "nic_baro",    a, &a->nic_baro_valid,      "%u",       (unsigned) a->nic_baro);
         }
 
         // only emit alt, speed, latlon, track etc if they have been received since the last time
@@ -2780,8 +2821,8 @@ static void writeFATSV()
         p = appendFATSVMeta(p, end, "roll",        a, &a->roll_valid,           "%.1f", a->roll);
         p = appendFATSVMeta(p, end, "heading_magnetic", a, &a->mag_heading_valid, "%.1f", a->mag_heading);
         p = appendFATSVMeta(p, end, "heading_true", a, &a->true_heading_valid,    "%.1f", a->true_heading);
-        p = appendFATSVMeta(p, end, "nav_alt_mcp", a, &a->nav_altitude_mcp_valid, "%u",   a->nav_altitude_mcp);
-        p = appendFATSVMeta(p, end, "nav_alt_fms", a, &a->nav_altitude_fms_valid, "%u",   a->nav_altitude_fms);
+        p = appendFATSVMeta(p, end, "nav_alt_mcp", a, &a->nav_altitude_mcp_valid, "%d",   a->nav_altitude_mcp);
+        p = appendFATSVMeta(p, end, "nav_alt_fms", a, &a->nav_altitude_fms_valid, "%d",   a->nav_altitude_fms);
         p = appendFATSVMeta(p, end, "nav_alt_src", a, &a->nav_altitude_src_valid, "%s", nav_altitude_source_enum_string(a->nav_altitude_src));
         p = appendFATSVMeta(p, end, "nav_heading", a, &a->nav_heading_valid,    "%.1f", a->nav_heading);
         p = appendFATSVMeta(p, end, "nav_modes",   a, &a->nav_modes_valid,      "{%s}", nav_modes_flags_string(a->nav_modes));

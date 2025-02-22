@@ -3,7 +3,7 @@ PROGNAME=dump1090
 DUMP1090_VERSION ?= unknown
 
 CFLAGS ?= -O3 -g
-DUMP1090_CFLAGS := -std=c11 -fno-common -Wall -Wmissing-declarations -Werror -W
+DUMP1090_CFLAGS := -std=c11 -fno-common -Wall -Wmissing-declarations -Werror -Wformat-signedness -W
 DUMP1090_CPPFLAGS := -I. -D_POSIX_C_SOURCE=200112L -DMODES_DUMP1090_VERSION=\"$(DUMP1090_VERSION)\" -DMODES_DUMP1090_VARIANT=\"dump1090-fa\"
 
 LIBS = -lpthread -lm
@@ -35,6 +35,10 @@ ifeq ($(PKGCONFIG), yes)
     LIMESDR := $(shell pkg-config --exists LimeSuite && echo "yes" || echo "no")
   endif
 
+  ifndef SOAPYSDR
+    SOAPYSDR := $(shell pkg-config --exists SoapySDR && echo "yes" || echo "no")
+  endif
+
   ifndef MONGOC
     MONGOC := $(shell pkg-config --exists libmongoc-static-1.0 && echo "yes" || echo "no")
   endif
@@ -44,14 +48,15 @@ else
   BLADERF ?= no
   HACKRF ?= no
   LIMESDR ?= no
+  SOAPYSDR ?= no
   MONGOC ?= no
 endif
 
-HOST_UNAME := $(shell uname)
-HOST_ARCH := $(shell uname -m)
+BUILD_UNAME := $(shell uname)
+BUILD_ARCH := $(shell uname -m)
 
-UNAME ?= $(HOST_UNAME)
-ARCH ?= $(HOST_ARCH)
+UNAME ?= $(BUILD_UNAME)
+ARCH ?= $(BUILD_ARCH)
 
 ifeq ($(UNAME), Linux)
   DUMP1090_CPPFLAGS += -D_DEFAULT_SOURCE
@@ -68,6 +73,9 @@ ifeq ($(UNAME), Darwin)
   endif
   DUMP1090_CPPFLAGS += -DMISSING_NANOSLEEP
   COMPAT += compat/clock_nanosleep/clock_nanosleep.o
+  ifeq ($(PKGCONFIG), yes)
+    LIBS_SDR += $(shell pkg-config --libs-only-L libusb-1.0)
+  endif
   LIBS_USB += -lusb-1.0
   LIBS_CURSES := -lncurses
   # cpufeatures reportedly does not work (yet) on darwin arm64
@@ -104,12 +112,8 @@ ifeq ($(CPUFEATURES),yes)
   DUMP1090_CPPFLAGS += -DENABLE_CPUFEATURES -Icpu_features/include
 endif
 
-
-CPPFLAGS += -DMODES_DUMP1090_VERSION=\"$(DUMP1090_VERSION)\" -DMODES_DUMP1090_VARIANT=\"dump1090-fa\"
-
-DIALECT = -std=c11
-CFLAGS += $(DIALECT) -O2 -g -Wall -Werror -W -D_DEFAULT_SOURCE
-LIBS = -lpthread -lm -lrt
+RTLSDR ?= yes
+BLADERF ?= yes
 
 ifeq ($(RTLSDR), yes)
   SDR_OBJ += sdr_rtlsdr.o
@@ -164,6 +168,13 @@ ifeq ($(LIMESDR), yes)
   LIBS_SDR += $(shell pkg-config --libs LimeSuite)
 endif
 
+ifeq ($(SOAPYSDR), yes)
+  SDR_OBJ += sdr_soapy.o
+  DUMP1090_CPPFLAGS += -DENABLE_SOAPYSDR
+  DUMP1090_CFLAGS += $(shell pkg-config --cflags SoapySDR)
+  LIBS_SDR += $(shell pkg-config --libs SoapySDR)
+endif
+
 ifeq ($(MONGOC), yes)
   SDR_OBJ += mongo_conn.o
   CPPFLAGS += -DENABLE_MONGOC
@@ -182,6 +193,10 @@ ifneq ($(CPUFEATURES),yes)
 else
   ifeq ($(ARCH),x86_64)
     # AVX, AVX2
+    STARCH_MIX := x86
+    DUMP1090_CPPFLAGS += -DSTARCH_MIX_X86
+  else ifeq ($(ARCH),amd64)
+    # this is the Debian naming of x86_64
     STARCH_MIX := x86
     DUMP1090_CPPFLAGS += -DSTARCH_MIX_X86
   else ifeq ($(findstring aarch,$(ARCH)),aarch)
@@ -209,16 +224,15 @@ include dsp/generated/makefile.$(STARCH_MIX)
 
 showconfig:
 	@echo "Building with:" >&2
-	@echo "  Version string:  $(DUMP1090_VERSION)" >&2
-	@echo "  Architecture:    $(ARCH)" >&2
-	@echo "  DSP mix:         $(STARCH_MIX)" >&2
-	@echo "  RTLSDR support:  $(RTLSDR)" >&2
-	@echo "  BladeRF support: $(BLADERF)" >&2
-	@echo "  HackRF support:  $(HACKRF)" >&2
-	@echo "  LimeSDR support: $(LIMESDR)" >&2
-	@echo "  MongoDB support: $(MONGOC)" >&2
-
-.PHONY: dist
+	@echo "  Version string:   $(DUMP1090_VERSION)" >&2
+	@echo "  Architecture:     $(ARCH)" >&2
+	@echo "  DSP mix:          $(STARCH_MIX)" >&2
+	@echo "  RTLSDR support:   $(RTLSDR)" >&2
+	@echo "  BladeRF support:  $(BLADERF)" >&2
+	@echo "  HackRF support:   $(HACKRF)" >&2
+	@echo "  LimeSDR support:  $(LIMESDR)" >&2
+	@echo "  SoapySDR support: $(SOAPYSDR)" >&2
+	@echo "  MongoDB support:  $(MONGOC)" >&2
 
 %.o: %.c *.h
 	$(CC) $(ALL_CCFLAGS) -c $< -o $@
@@ -236,7 +250,7 @@ starch-benchmark: cpu.o dsp/helpers/tables.o $(CPUFEATURES_OBJS) $(STARCH_OBJS) 
 	$(CC) -g -o $@ $^ $(LDFLAGS) $(LIBS)
 
 clean:
-	rm -rf *.o oneoff/*.o compat/clock_gettime/*.o compat/clock_nanosleep/*.o cpu_features/src/*.o dsp/generated/*.o dsp/helpers/*.o $(CPUFEATURES_OBJS) dump1090 view1090 faup1090 cprtests crctests oneoff/convert_benchmark oneoff/decode_comm_b oneoff/dsp_error_measurement oneoff/uc8_capture_stats starch-benchmark $(DISTDIR)
+	rm -f *.o oneoff/*.o compat/clock_gettime/*.o compat/clock_nanosleep/*.o cpu_features/src/*.o dsp/generated/*.o dsp/helpers/*.o $(CPUFEATURES_OBJS) dump1090 view1090 faup1090 cprtests crctests oneoff/convert_benchmark oneoff/decode_comm_b oneoff/dsp_error_measurement oneoff/uc8_capture_stats starch-benchmark
 
 test: cprtests
 	./cprtests
